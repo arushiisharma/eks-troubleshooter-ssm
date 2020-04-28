@@ -74,9 +74,6 @@ mainSteps:
           ClusterName:
             Description: Name of the cluster to troubleshoot
             Type: "String"
-          SSHKeyName:
-            Description: Amazon Ec2 key name
-            Type: "AWS::EC2::KeyPair::KeyName"
           VpcId:
             Description: Vpc for the instance. Make sure the VPC is connected to the internet
             Type: "AWS::EC2::VPC::Id"
@@ -123,11 +120,6 @@ mainSteps:
               GroupDescription: Security group for the eks troubleshooter instance
               VpcId:
                 Ref: VpcId
-              SecurityGroupIngress:
-                - IpProtocol: tcp
-                  FromPort: 22
-                  ToPort: 22
-                  CidrIp: 0.0.0.0/0
               SecurityGroupEgress:
                 - IpProtocol: "-1"
                   FromPort: "-1"
@@ -181,7 +173,6 @@ mainSteps:
               IamInstanceProfile: !Ref EksTroubleshooterInstanceProfile
               InstanceType: 't3.micro'
               ImageId: 'ami-0323c3dd2da7fb37d'
-              KeyName: !Ref SSHKeyName
               SubnetId: !Ref SubnetId
               SecurityGroupIds:
                 - !GetAtt EksTroubleshooterSecGrp.GroupId
