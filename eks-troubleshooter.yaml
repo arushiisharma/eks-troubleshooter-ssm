@@ -6,7 +6,7 @@ description: >+
   practices
 
 schemaVersion: '0.3'
-assumeRole: ''
+assumeRole: 'arn:aws:iam::992445968102:role/ssm-automation-dummy-role'
 parameters:
   clusterName:
     type: String
@@ -25,284 +25,88 @@ mainSteps:
       ### getCallerDetails
 
       Get details of the user/role calling this automation.
-  - name: getDefaultVpcDetails
+  - name: getClusterDetails
     action: 'aws:executeAwsApi'
     inputs:
-      Service: ec2
-      Api: DescribeVpcs
-      Filters:
-        - Name: isDefault
-          Values:
-            - 'true'
+      Service: eks
+      Api: DescribeCluster
+      name: '{{ clusterName }}'
     outputs:
-      - Name: fullDetails
-        Selector: '$.Vpcs[0]'
-        Type: StringMap
-      - Name: vpcId
-        Selector: '$.Vpcs[0].VpcId'
+      - Name: endpoint
+        Selector: $.cluster.endpoint
         Type: String
-    description: |-
-      ### getDefaultVpcDetails
-      Get the default VPC of the account. 
-  - name: getDefaultSubnetDetails
-    action: 'aws:executeAwsApi'
-    inputs:
-      Service: ec2
-      Filters:
-        - Name: vpc-id
-          Values:
-            - '{{ getDefaultVpcDetails.vpcId }}'
-      Api: DescribeSubnets
-    outputs:
-      - Name: subnetId
-        Selector: '$.Subnets[0].SubnetId'
-        Type: String
-    description: >-
-      ### getSubnetDetails
-
-      Get the subnets present in the default VPC and output any random one of
-      them. The output subnet is the used to launch the troubleshooter EC2.
-  - name: launchTroubleshooterStack
-    action: 'aws:createStack'
-    description: |-
-      ### launchTroubleshooterStack
-      Launch a CloudFormation stack for troubleshooting.
-    inputs:
-      StackName: EksTroubleshooter-Stack
-      TemplateBody: |
-        Parameters:
-          ClusterName:
-            Description: Name of the cluster to troubleshoot
-            Type: "String"
-          VpcId:
-            Description: Vpc for the instance. Make sure the VPC is connected to the internet
-            Type: "AWS::EC2::VPC::Id"
-          SubnetId:
-            Description: Subnet to launch the ec2 in. Make sure it is connected to the internet
-            Type: "AWS::EC2::Subnet::Id"
-        Resources:
-          EksTroubleshooterRole: 
-            Type: "AWS::IAM::Role"
-            Properties:
-              AssumeRolePolicyDocument: 
-                Version: "2012-10-17"
-                Statement: 
-                  - Principal:
-                      Service:
-                        - "ec2.amazonaws.com"
-                    Action:
-                      - 'sts:AssumeRole'
-                    Effect: Allow
-              ManagedPolicyArns:
-                - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore' 
-              Policies:
-                - PolicyName: "EksPermissions"
-                  PolicyDocument: 
-                    Version: "2012-10-17"
-                    Statement:
-                      - Effect: Allow
-                        Action: 
-                          - "eks:UpdateClusterConfig"
-                          - "eks:DescribeCluster"
-                        Resource: "*"
-                    
-          EksTroubleshooterInstanceProfile:
-            DependsOn:
-              - EksTroubleshooterRole
-            Type: "AWS::IAM::InstanceProfile"
-            Properties:
-              InstanceProfileName: EksTroubleeshooterInstanceProfile
-              Roles:
-                - Ref: EksTroubleshooterRole
-          EksTroubleshooterSecGrp:
-            Type: AWS::EC2::SecurityGroup
-            Properties:
-              GroupDescription: Security group for the eks troubleshooter instance
-              VpcId:
-                Ref: VpcId
-              SecurityGroupEgress:
-                - IpProtocol: "-1"
-                  FromPort: "-1"
-                  CidrIp: 0.0.0.0/0
-          EksTroubleshooterInstance:
-            DependsOn:
-              - EksTroubleshooterInstanceProfile
-              - EksTroubleshooterSecGrp
-            Type: "AWS::EC2::Instance"
-            Metadata:
-              'AWS::CloudFormation::Init':
-                configSets:
-                  default:
-                    - createAwsConfigFile
-                    - installKubectl
-                    - configureKubeconfig
-                createAwsConfigFile:
-                  files:
-                    "/root/.aws/config":
-                      content:
-                        "Fn::Join":
-                          - ""
-                          - 
-                            - "[default]\n"
-                            - "region = "
-                            - !Ref 'AWS::Region'
-                            - "\n"
-                            - "output = json"
-                      mode: "000644"
-                      owner: "root"
-                      group: "root"
-                installKubectl:
-                  commands:
-                    install:
-                      command: "curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.15.10/2020-02-22/bin/linux/amd64/kubectl"
-                      cwd: "/bin/"
-                      ignoreErrors: "false"
-                    makeExecutable:
-                      command: "chmod +x kubectl"
-                      cwd: "/bin/"
-                configureKubeconfig:
-                  commands:
-                    configure:
-                      command: 
-                        Fn::Join:
-                          - ""
-                          - 
-                            - "aws eks update-kubeconfig --name "
-                            - !Ref ClusterName
-            Properties:
-              IamInstanceProfile: !Ref EksTroubleshooterInstanceProfile
-              InstanceType: 't3.micro'
-              ImageId: 'ami-0323c3dd2da7fb37d'
-              SubnetId: !Ref SubnetId
-              SecurityGroupIds:
-                - !GetAtt EksTroubleshooterSecGrp.GroupId
-              UserData: !Base64 
-                'Fn::Join':
-                  - ''
-                  - 
-                    - |
-                      #!/bin/bash -xe
-                    - |
-                      # Install the files and packages from the metadata
-                    - '/opt/aws/bin/cfn-init -v '
-                    - '         --stack '
-                    - !Ref 'AWS::StackName'
-                    - '         --resource EksTroubleshooterInstance '
-                    - '         --configsets default '
-                    - '         --region '
-                    - !Ref 'AWS::Region'
-                    - |+
-        Outputs:
-          Ec2PublicIp:
-            Description: Use this to SSH into the Ec2
-            Value: !GetAtt EksTroubleshooterInstance.PublicIp
-          Ec2RoleArn:
-            Description: The role arn that needs to be granted access to the cluster through aws-iam-authenticator
-            Value: !GetAtt EksTroubleshooterRole.Arn
-          Ec2InstanceId:
-            Description: The instance id of the troubleshooter ec2
-            Value: !Ref EksTroubleshooterInstance
-      Capabilities:
-        - CAPABILITY_IAM
-        - CAPABILITY_NAMED_IAM
-      Parameters:
-        - ParameterKey: ClusterName
-          ParameterValue: '{{ clusterName }}'
-        - ParameterKey: VpcId
-          ParameterValue: '{{ getDefaultVpcDetails.vpcId }}'
-        - ParameterKey: SubnetId
-          ParameterValue: '{{ getDefaultSubnetDetails.subnetId }}'
-  - name: getTroubleshooterStackDetails
-    action: 'aws:executeAwsApi'
-    inputs:
-      Service: cloudformation
-      Api: DescribeStacks
-      StackName: EksTroubleshooter-Stack
-    outputs:
-      - Name: Stack
-        Selector: '$.Stacks[0]'
-        Type: StringMap
-    description: >-
-      ### getTroubleshooterStackOuputs
-
-      Get the details of the stack created in the `launchTroubleshooterStack`
-      step. 
-  - name: getTroubleshooterStackOutputs
+    description: get cluster details
+  - name: getClusterServices
     action: 'aws:executeScript'
-    description: |-
-      ### getTroubleshooterStackOutput
-      Get the outputs of the troubleshooter stack.
-
-      The outputs are:- 
-      - Ec2PublicIp
-      - Ec2RoleArn
-      - Ec2InstanceId
     inputs:
       Runtime: python3.6
-      Handler: getStackOutputs
-      Script: |-
-        def getStackOutputs(events, context):
-          stack = events['stack']
+      Handler: script_handler
+      Script: |
+        import base64
+        import boto3
+        import re
+        from botocore.signers import RequestSigner
+        import urllib.request
+        import ssl
+        import json
+
+        def script_handler(events, context):
+          headers = {'Authorization': 'Bearer ' + get_bearer_token('practice', 'us-east-1')}
+          ep = events['endpoint']
+          api_ep = ep + "/api/v1/namespaces/default/services"
           
-          outputs = dict()
-          
-          for output in stack['Outputs']:
-            outputs.update({ output['OutputKey'] : output['OutputValue'] })
-            
-          return outputs
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ctx.verify_mode = ssl.CERT_NONE
+          req = urllib.request.Request(api_ep, headers=headers)
+          res = urllib.request.urlopen(req, context=ctx)
+          data = json.load(res)
+          return(data)
+
+        def get_bearer_token(cluster_id, region):
+            STS_TOKEN_EXPIRES_IN = 60
+            session = boto3.session.Session()
+
+            client = session.client('sts', region_name=region)
+            service_id = client.meta.service_model.service_id
+
+            signer = RequestSigner(
+                service_id,
+                region,
+                'sts',
+                'v4',
+                session.get_credentials(),
+                session.events
+            )
+
+            params = {
+                'method': 'GET',
+                'url': 'https://sts.{}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15'.format(region),
+                'body': {},
+                'headers': {
+                    'x-k8s-aws-id': cluster_id
+                },
+                'context': {}
+            }
+
+            signed_url = signer.generate_presigned_url(
+                params,
+                region_name=region,
+                expires_in=STS_TOKEN_EXPIRES_IN,
+                operation_name=''
+            )
+
+            base64_url = base64.urlsafe_b64encode(signed_url.encode('utf-8')).decode('utf-8')
+
+            # remove any base64 encoding padding:
+            return 'k8s-aws-v1.' + re.sub(r'=*', '', base64_url)
       InputPayload:
-        stack: '{{ getTroubleshooterStackDetails.Stack }}'
+        endpoint: '{{ getClusterDetails.endpoint }}'
     outputs:
-      - Name: Ec2InstanceId
-        Selector: $.Payload.Ec2InstanceId
-        Type: String
-      - Name: Ec2PublicIp
-        Selector: $.Payload.Ec2PublicIp
-        Type: String
-      - Name: Ec2RoleArn
-        Selector: $.Payload.Ec2RoleArn
-        Type: String
-  - name: pauseAndAllowClusterAccess
-    action: 'aws:pause'
-    inputs:
-      Message: >-
-        <name>: {{ clusterName }} \n <arn>: {{
-        getTroubleshooterStackOutputs.Ec2RoleArn }}"
-    description: >-
-      ### pauseAndAllowClusterAccess
-
-      This step pauses the automation till the user grants it access to the
-      cluster. This allows the automation to make API calls to the cluster to
-      diagnose errors.
-
-
-      To proceed, complete the following step's execution:-
-
-      - Make sure you have eksctl installed and configured to use the correct
-      credentials
-
-      - Then, run the follwing command:-
-
-        `eksctl create iamidentitymapping --cluster <name> --arn <arn> --group system:masters`
-
-      The `<name>` and `<arn>` values can be found in the message of this step.
-  - name: getClusterServices
-    action: 'aws:runCommand'
-    inputs:
-      DocumentName: AWS-RunShellScript
-      InstanceIds:
-        - '{{ getTroubleshooterStackOutputs.Ec2InstanceId }}'
-      Parameters:
-        commands:
-          - kubectl get svc -o json
-        workingDirectory: /root/
-    outputs:
-      - Name: Services
-        Selector: $
+      - Name: services
+        Selector: $.Payload
         Type: StringMap
-    description: |-
-      ### getClusterServices
-      Use `kubectl` to the services running on the cluster
+    description: Get k8s services
   - name: getClusterDetailsFromEks
     action: 'aws:executeAwsApi'
     outputs:
