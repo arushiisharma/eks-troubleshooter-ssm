@@ -1,0 +1,164 @@
+description: >
+  # Eks Troubleshooter  This automation helps troubleshoot common eks errors and
+  enforce best practices
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::260656001781:role/role1'
+parameters:
+  clusterName:
+    type: String
+    description: Name of the cluster. This cluster must be running in your AWS account.
+  Region:
+    type: String
+    description: >-
+      Region in which the cluster is present. This cluster must be running in
+      your AWS account
+mainSteps:
+  - name: getClusterDetailsFromEks
+    action: 'aws:executeAwsApi'
+    outputs:
+      - Name: clusterDetails
+        Selector: $.cluster
+        Type: StringMap
+      - Name: name
+        Selector: $.cluster.name
+        Type: String
+      - Name: endpoint
+        Selector: $.cluster.endpoint
+        Type: String
+      - Name: roleArn
+        Selector: $.cluster.roleArn
+        Type: String
+      - Name: clusterSecurityGroupId
+        Selector: $.cluster..resourcesVpcConfig..clusterSecurityGroupId
+        Type: StringList
+      - Name: arn
+        Selector: $.cluster.arn
+        Type: String
+      - Name: vpcId
+        Selector: $.cluster..resourcesVpcConfig..vpcId
+        Type: StringList
+    inputs:
+      Service: eks
+      Api: DescribeCluster
+      name: '{{ clusterName }}'
+    description: >-
+      ### getClusterDetailsFromEks Get the details of the given cluster from the
+      EKS API. This is the state of the cluster as seen by EKS. 
+  - name: getEC2ListWithTags
+    action: 'aws:executeAwsApi'
+    description: >-
+      ### getEC2ListWithTags Get the all the EC2 InstancesIDs that are
+      associated with the tag 'kubernetes.io/cluster/<cluster-name> --> owned'
+      along  with associated security group IDs
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      Filters:
+        - Name: 'tag:kubernetes.io/cluster/{{ getClusterDetailsFromEks.name }}'
+          Values:
+            - owned
+    outputs:
+      - Name: InstanceId
+        Selector: $.Reservations..Instances..InstanceId
+        Type: StringList
+      - Name: SecurityGroupId
+        Selector: $.Reservations..Instances..SecurityGroups..GroupId
+        Type: StringList
+  - name: getSubnetID
+    action: 'aws:executeAwsApi'
+    description: '### getSubnetID Get all the SubnetIDs present in the VPC'
+    inputs:
+      Service: ec2
+      Filters:
+        - Name: vpc-id
+          Values:
+            - '{{ getClusterDetailsFromEks.vpcId }}'
+      Api: DescribeSubnets
+    outputs:
+      - Name: subnetId
+        Selector: $.Subnets..SubnetId
+        Type: StringList
+  - name: checkSubnetsForTags
+    action: 'aws:executeScript'
+    description: |-
+      ### checkSubnetsForTags, checking subnets for the correct tags
+        'kubernetes.io/role/elb → 1' - Public subnet tagging requirement for external load balancers
+        'kubernetes.io/role/internal-elb → 1' - Private subnet tagging requirement for internal load balancers
+    inputs:
+      Runtime: python3.6
+      Handler: subnetTagsCheck
+      Script: |
+        import boto3
+        import json
+
+        def subnetTagsCheck(events,context):
+            elbKey = 0
+            key = 0
+            clusterName = events['clusterName']
+            subnetIds= events['subnetIds'] 
+            region = events['region']
+            eksClient = boto3.client('eks', region_name=region)
+            ec2 = boto3.resource('ec2', region_name=region)
+            for subnetId in subnetIds:
+                elbKey = 0
+                key = 0
+                for tag in ec2.Subnet(subnetId).tags:
+                    if(str('kubernetes.io/cluster/'+clusterName) in tag.values()):
+                        key=1
+                        if('shared' not in tag.values()):
+                            print("Add", 'kubernetes.io/cluster/'+clusterName, "shared tag in subnet",subnetId)
+                    if('kubernetes.io/role/elb' in tag.values() or 'kubernetes.io/role/internal-elb' in tag.values()):
+                        elbKey = 1
+                        if('1' not in tag.values()):
+                            print("Add 'For private subnets- kubernetes.io/role/internal-elb -> 1'  or 'For public subnets- kubernetes.io/role/elb -> 1' tag in the subnet",subnetId)
+                if(not elbKey):
+                    print("Add 'kubernetes.io/role/internal-elb -> 1' tag for private subnets or 'kubernetes.io/role/elb -> 1' tag for public subnets:",subnetId)
+                if(not key):
+                     print("Add", 'kubernetes.io/cluster/'+clusterName, "shared tag in subnet",subnetId)
+      InputPayload:
+        clusterName: '{{ clusterName }}'
+        subnetIds: '{{ getSubnetID.subnetId }}'
+        region: '{{ Region }}'
+    outputs:
+      - Name: Payload
+        Selector: $.Payload
+        Type: StringMap
+  - name: checkSecurityGroupsForTags
+    action: 'aws:executeScript'
+    description: >-
+      ### checkSecurityGroupsForTags, checking security groups associated with
+      each instances for the correct  tag- 'kubernetes.io/cluster/<cluster-name>
+      →  owned'.
+    inputs:
+      Runtime: python3.6
+      Handler: securityGroupTagCheck
+      Script: |-
+        import boto3
+        import json
+
+        def securityGroupTagCheck(events,context):
+                    keyfound = 0
+                    clusterName = events['clusterName']
+                    securityGroupIds= events['securityGroupIds'] 
+                    region = events['region']
+                    ec2 = boto3.resource('ec2',region_name=region)
+                    for sg in securityGroupIds:
+                        keyfound = 0
+                        tags = ec2.SecurityGroup(sg).tags 
+                        if len(tags) != 0:
+                          for tag in ec2.SecurityGroup(sg).tags:
+                            if('kubernetes.io/cluster/'+clusterName in tag.values()):
+                                keyfound = 1
+                                if('owned' not in tag.values()):
+                                    print("Add kubernetes.io/cluster/"+clusterName, "-> owned tag to the security group",sg)
+                                    break
+                        if(not keyfound):
+                            print("Add kubernetes.io/cluster/" + clusterName, "-> owned tag to the security group", sg)
+      InputPayload:
+        clusterName: '{{ clusterName }}'
+        securityGroupIds: '{{ getEC2ListWithTags.SecurityGroupId }}'
+        region: '{{ Region }}'
+    outputs:
+      - Name: Payload
+        Selector: $.Payload
+        Type: StringMap
