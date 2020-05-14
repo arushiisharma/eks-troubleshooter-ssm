@@ -6,11 +6,13 @@ description: >+
   practices
 
 schemaVersion: '0.3'
-assumeRole: 'arn:aws:iam::992445968102:role/ssm-automation-dummy-role'
 parameters:
   clusterName:
     type: String
     description: Name of the cluster. This cluster must be running in your AWS account.
+  region:
+    type: String
+    description: The region of your cluster
 mainSteps:
   - name: getCallerDetails
     action: 'aws:executeAwsApi'
@@ -21,22 +23,142 @@ mainSteps:
       - Name: callerIdentity
         Selector: $
         Type: StringMap
+      - Name: Arn
+        Selector: $.Arn
+        Type: String
     description: |-
       ### getCallerDetails
 
       Get details of the user/role calling this automation.
-  - name: getClusterDetails
+  - name: createTroubleshooterPolicy
     action: 'aws:executeAwsApi'
+    description: |-
+      ### createTroubleshooterPolicy
+      Create a policy to be used by the SSM service role
+    inputs:
+      Service: iam
+      Api: CreatePolicy
+      PolicyName: eks-troubleshooter-policy
+      PolicyDocument: >-
+        { "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Action":
+        "*", "Resource": "*" } ] } 
+    outputs:
+      - Name: Arn
+        Selector: $.Policy.Arn
+        Type: String
+  - name: createTroubleshooterRole
+    action: 'aws:executeAwsApi'
+    description: |-
+      ### createTroubleshooterRole
+      Create a service role to be used by the troubleshooter
+    inputs:
+      Service: iam
+      Api: CreateRole
+      RoleName: eks-troubleshooter-role
+      AssumeRolePolicyDocument: "{\r\n  \"Version\": \"2012-10-17\",\r\n  \"Statement\": [\r\n    {\r\n      \"Effect\": \"Allow\",\r\n      \"Principal\": {\r\n        \"AWS\": \"{{ getCallerDetails.Arn }}\",\r\n        \"Service\": \"ssm.amazonaws.com\"\r\n      },\r\n      \"Action\": \"sts:AssumeRole\"\r\n    }\r\n  ]\r\n}"
+    outputs:
+      - Name: roleArn
+        Selector: $.Role.Arn
+        Type: String
+  - name: attachPolicyToRole
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: iam
+      Api: AttachRolePolicy
+      RoleName: eks-troubleshooter-role
+      PolicyArn: '{{ createTroubleshooterPolicy.Arn }}'
+    description: |-
+      ### attachPolicyToRole
+      Attach troubleshooter policy to its role
+  - name: getEksClusterDetails
+    action: 'aws:executeAwsApi'
+    outputs:
+      - Name: clusterDetails
+        Selector: $.cluster
+        Type: StringMap
+      - Name: name
+        Selector: $.cluster.name
+        Type: String
+      - Name: endpoint
+        Selector: $.cluster.endpoint
+        Type: String
+      - Name: roleArn
+        Selector: $.cluster.roleArn
+        Type: String
+      - Name: vpcId
+        Selector: $.cluster.resourcesVpcConfig.vpcId
+        Type: String
+      - Name: subnetIds
+        Selector: $.cluster.resourcesVpcConfig.subnetIds
+        Type: StringList
+      - Name: clusterSecurityGroupId
+        Selector: $.cluster.resourcesVpcConfig.clusterSecurityGroupId
+        Type: String
+      - Name: securityGroupIds
+        Selector: $.cluster.resourcesVpcConfig.securityGroupIds
+        Type: StringList
+      - Name: arn
+        Selector: $.cluster.arn
+        Type: String
     inputs:
       Service: eks
       Api: DescribeCluster
       name: '{{ clusterName }}'
+    description: >-
+      ### getEksClusterDetails
+
+
+      Get the details of the given cluster from the EKS API. This is the state
+      of the cluster as seen by EKS. 
+  - name: getEC2ListWithTags
+    action: 'aws:executeAwsApi'
+    description: >-
+      ### getEC2ListWithTags Get the all the EC2 InstancesIDs that are
+      associated with the tag 'kubernetes.io/cluster/<cluster-name> --> owned'
+      along  with associated security group IDs
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      Filters:
+        - Name: 'tag:kubernetes.io/cluster/{{ getEksClusterDetails.name }}'
+          Values:
+            - owned
     outputs:
-      - Name: endpoint
-        Selector: $.cluster.endpoint
-        Type: String
-    description: get cluster details
-  - name: getClusterServices
+      - Name: InstanceId
+        Selector: $.Reservations..Instances..InstanceId
+        Type: StringList
+      - Name: Instances
+        Selector: $.Reservations..Instances[0]
+        Type: MapList
+      - Name: SecurityGroupId
+        Selector: $.Reservations..Instances..SecurityGroups..GroupId
+        Type: StringList
+  - name: allowClusterAccess
+    action: 'aws:pause'
+    inputs:
+      Message: >-
+        eksctl create iamidentitymapping --cluster {{ getEksClusterDetails.name
+        }} --arn {{ createTroubleshooterRole.roleArn}} --group system:masters
+    description: >-
+      ### allowClusterAccess
+
+      To allow the automation to access your Kubernetes cluster, run the command
+      in the message of this step from your local machine. 
+  - name: assumeTroubleshooterRole
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: sts
+      Api: AssumeRole
+      RoleArn: '{{ createTroubleshooterRole.roleArn }}'
+      RoleSessionName: abcc
+    outputs:
+      - Name: Credentials
+        Selector: $.Credentials
+        Type: StringMap
+    description: |-
+      ### assumeServiceRole
+      Assume the service role created in the previous steps
+  - name: generateBearerToken
     action: 'aws:executeScript'
     inputs:
       Runtime: python3.6
@@ -51,23 +173,22 @@ mainSteps:
         import json
 
         def script_handler(events, context):
-          headers = {'Authorization': 'Bearer ' + get_bearer_token('practice', 'us-east-1')}
-          ep = events['endpoint']
-          api_ep = ep + "/api/v1/namespaces/default/services"
-          
-          ctx = ssl.create_default_context()
-          ctx.check_hostname = False
-          ctx.verify_mode = ssl.CERT_NONE
-          req = urllib.request.Request(api_ep, headers=headers)
-          res = urllib.request.urlopen(req, context=ctx)
-          data = json.load(res)
-          return(data)
+          clusterName = events['clusterName']
+          region = events['region']
+          creds = events['creds']
+          bearerToken = get_bearer_token(clusterName, region, creds)
+          return(bearerToken)
 
-        def get_bearer_token(cluster_id, region):
+        def get_bearer_token(cluster_id, region, creds):
             STS_TOKEN_EXPIRES_IN = 60
-            session = boto3.session.Session()
+            
+            session = boto3.session.Session(
+              aws_access_key_id=creds['AccessKeyId'], 
+              aws_secret_access_key=creds['SecretAccessKey'], 
+              aws_session_token=creds['SessionToken'],
+              region_name=region)
 
-            client = session.client('sts', region_name=region)
+            client = session.client('sts')
             service_id = client.meta.service_model.service_id
 
             signer = RequestSigner(
@@ -101,50 +222,53 @@ mainSteps:
             # remove any base64 encoding padding:
             return 'k8s-aws-v1.' + re.sub(r'=*', '', base64_url)
       InputPayload:
-        endpoint: '{{ getClusterDetails.endpoint }}'
+        creds: '{{ assumeTroubleshooterRole.Credentials }}'
+        clusterName: '{{ getEksClusterDetails.name }}'
+        region: '{{ region }}'
+    outputs:
+      - Name: token
+        Selector: $.Payload
+        Type: String
+    description: |-
+      ### generateBearerToken
+      This token is generated to authenticate to the kubernetes cluster
+  - name: getClusterServices
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |-
+        import urllib.request
+        import ssl
+        import json
+
+        def script_handler(events, context):
+          #clusterName = events['clusterName']
+          #region = events['region']
+          #creds = events['creds']
+          bearerToken = events['bearerToken']
+          headers = {'Authorization': 'Bearer ' + bearerToken}
+
+          ep = events['endpoint']
+          api_ep = ep + "/api/v1/namespaces/default/services"
+          
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ctx.verify_mode = ssl.CERT_NONE
+          
+          req = urllib.request.Request(api_ep, headers=headers)
+          res = urllib.request.urlopen(req, context=ctx)
+          data = json.load(res)
+          return(data)
+      InputPayload:
+        endpoint: '{{ getEksClusterDetails.endpoint }}'
+        bearerToken: '{{ generateBearerToken.token }}'
     outputs:
       - Name: services
         Selector: $.Payload
         Type: StringMap
-    description: Get k8s services
-  - name: getClusterDetailsFromEks
-    action: 'aws:executeAwsApi'
-    outputs:
-      - Name: clusterDetails
-        Selector: $.cluster
-        Type: StringMap
-      - Name: name
-        Selector: $.cluster.name
-        Type: String
-      - Name: endpoint
-        Selector: $.cluster.endpoint
-        Type: String
-      - Name: roleArn
-        Selector: $.cluster.roleArn
-        Type: String
-      - Name: vpcId
-        Selector: $.cluster.resourceVpcConfig.vpcId
-        Type: String
-      - Name: subnetIds
-        Selector: $.cluster.resourceVpcConfig.subnetIds
-        Type: StringList
-      - Name: clusterSecurityGroupId
-        Selector: $.cluster.resourceVpcConfig.clusterSecurityGroupId
-        Type: String
-      - Name: securityGroupIds
-        Selector: $.cluster.resourceVpcConfig.securityGroupIds
-        Type: String
-      - Name: arn
-        Selector: $.cluster.arn
-        Type: String
-    inputs:
-      Service: eks
-      Api: DescribeCluster
-      name: '{{ clusterName }}'
-    description: >-
-      ### getClusterDetailsFromEks
+    description: |-
+      getClusterServices
 
-
-      Get the details of the given cluster from the EKS API. This is the state
-      of the cluster as seen by EKS. 
+      Get a list of services in the default namespace
 
