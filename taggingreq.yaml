@@ -90,7 +90,6 @@ mainSteps:
       Script: |
         import boto3
         import json
-
         def subnetTagsCheck(events,context):
             elbKey = 0
             key = 0
@@ -132,28 +131,29 @@ mainSteps:
     inputs:
       Runtime: python3.6
       Handler: securityGroupTagCheck
-      Script: |-
+      Script: |
         import boto3
         import json
-
         def securityGroupTagCheck(events,context):
-                    keyfound = 0
-                    clusterName = events['clusterName']
-                    securityGroupIds= events['securityGroupIds'] 
-                    region = events['region']
-                    ec2 = boto3.resource('ec2',region_name=region)
-                    for sg in securityGroupIds:
-                        keyfound = 0
-                        tags = ec2.SecurityGroup(sg).tags 
-                        if len(tags) != 0:
-                          for tag in ec2.SecurityGroup(sg).tags:
-                            if('kubernetes.io/cluster/'+clusterName in tag.values()):
-                                keyfound = 1
-                                if('owned' not in tag.values()):
-                                    print("Add kubernetes.io/cluster/"+clusterName, "-> owned tag to the security group",sg)
-                                    break
-                        if(not keyfound):
-                            print("Add kubernetes.io/cluster/" + clusterName, "-> owned tag to the security group", sg)
+           
+            key = 0
+            clusterName = events['clusterName']
+            securityGroupIds= events['securityGroupIds'] 
+            region = events['region']
+            eksClient = boto3.client('eks', region_name=region)
+            ec2 = boto3.resource('ec2', region_name=region)
+            securityGroupIds = list(dict.fromkeys(securityGroupIds))
+            for securitygrpId in securityGroupIds:
+                key = 0
+                tags = ec2.SecurityGroup(securitygrpId).tags
+                if len(tags) != 0:
+                    for tag in ec2.SecurityGroup(securitygrpId).tags:
+                        if(str('kubernetes.io/cluster/'+clusterName) in tag.values()):
+                            key=1
+                            if('owned' not in tag.values()):
+                                print("Add", 'kubernetes.io/cluster/'+clusterName, "owned tag in subnet",securitygrpId)
+                    if(not key):
+                        print("Add", 'kubernetes.io/cluster/'+clusterName, "owned tag in subnet",securitygrpId)
       InputPayload:
         clusterName: '{{ clusterName }}'
         securityGroupIds: '{{ getEC2ListWithTags.SecurityGroupId }}'
