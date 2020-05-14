@@ -1,0 +1,74 @@
+description: '## Identifies the asgs which include the cluster instances.'
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::252500544628:role/AmazonSSMRoleForAutomationAssumeQuickSetup'
+parameters:
+  cluster:
+    type: String
+  region:
+    type: String
+mainSteps:
+  - name: getClusterDetails
+    action: 'aws:executeAwsApi'
+    outputs:
+      - Selector: $.cluster..resourcesVpcConfig..vpcId
+        Name: vpc_id
+        Type: StringList
+    inputs:
+      Service: eks
+      Api: DescribeCluster
+      name: '{{cluster}}'
+    description: >-
+      - Gets cluster details by running aws api funcitons, specifically vpc-id
+      of the cluster, which will be given as input to next step in the
+      automation.
+  - name: get_asgs_of_cluster_instances
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: listAsgsOfInstances
+      Script: |-
+        def listAsgsOfInstances(events, context):
+            import boto3
+            region = events['region'] 
+            vpc_id = events['vpc_id']
+            ec2 = boto3.resource('ec2', region)
+            client = boto3.client('autoscaling',region_name= region)
+            result = {}
+            instances_in_vpc = ec2.instances.filter(
+                Filters=[{
+                        'Name': 'instance-state-name',
+                        'Values': ['running']
+                    },
+                    {
+                        'Name': 'vpc-id',
+                        'Values': vpc_id
+                    }])
+            instances_in_vpc = [instance.id for instance in instances_in_vpc]
+            paginator = client.get_paginator('describe_auto_scaling_groups')
+            groups = paginator.paginate().build_full_result()
+            asgs = groups['AutoScalingGroups']
+            try:
+              for asg in groups['AutoScalingGroups']:
+                  asgName = asg['AutoScalingGroupName']
+                  instances = [i for i in asg['Instances']]
+                  instances = [instance['InstanceId'] for instance in instances]
+                  matched = list(set(instances).intersection(set(instances_in_vpc)))
+                  if(matched):
+                      result[asgName] = matched
+            except:
+              print("NOT PART OF ANY ASGS")
+            print(result)
+      InputPayload:
+        region: '{{region}}'
+        vpc_id: '{{getClusterDetails.vpc_id}}'
+    description: >-
+      - Runs a Python script which takes the vpc-id of the cluster as input from
+      the above step and finds out which asgs the instances in it belong to.(If
+      asgs are present). 
+
+      - The output of this step is an object, where the key is asg name and the
+      value is a list of instance-ids of the asg.
+    outputs:
+      - Name: Output
+        Selector: $.Payload.ExecutionLog
+        Type: StringMap
