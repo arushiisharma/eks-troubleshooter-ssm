@@ -1,0 +1,163 @@
+description: >
+# Eks Troubleshooter  This automation helps troubleshoot common eks errors and enforce best practices
+schemaVersion: '0.3'
+assumeRole: ''
+parameters:
+  clusterName:
+    type: String
+    description: Name of the cluster. This cluster must be running in your AWS account.
+  clusterRegion:
+    type: String
+    description: Region of the cluster running in your account.
+mainSteps:
+  - name: getCallerDetails
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: sts
+      Api: GetCallerIdentity
+    outputs:
+      - Name: callerIdentity
+        Selector: $
+        Type: StringMap
+    description: |-
+      ### getCallerDetails
+      Get details of the user/role calling this automation.
+  - name: getClusterDetails
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: eks
+      Api: DescribeCluster
+      name: '{{ clusterName }}'
+    outputs:
+      - Name: endpoint
+        Selector: $.cluster.endpoint
+        Type: String
+      - Name: k8version
+        Selector: $.cluster.version
+        Type: String
+    description: get cluster details
+  - name: getEC2sWithTags
+    action: 'aws:executeAwsApi'
+    description: >-
+      ### getEC2ListWithTags Get the all the EC2 InstancesIDs that are
+      associated with the tag 'kubernetes.io/cluster/<cluster-name> --> owned'
+      along  with associated security group IDs
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      Filters:
+        - Name: 'tag:kubernetes.io/cluster/{{ clusterName }}'
+          Values:
+            - owned
+    outputs:
+      - Name: instances
+        Selector: '$.Reservations..Instances[0]'
+        Type: MapList
+  - name: getLatestWindowsAmiCore
+    action: 'aws:executeAwsApi'
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: >-
+        /aws/service/ami-windows-latest/Windows_Server-2019-English-Core-EKS_Optimized-{{
+        getClusterDetails.k8version }}/image_id
+    outputs:
+      - Name: amiId
+        Selector: $.Parameter.Value
+        Type: String
+  - name: getLatestWindowsAmiFull
+    action: 'aws:executeAwsApi'
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: >-
+        /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-EKS_Optimized-{{
+        getClusterDetails.k8version }}/image_id
+    outputs:
+      - Name: amiId
+        Selector: $.Parameter.Value
+        Type: String
+  - name: getLatestWindowsAmi1909
+    action: 'aws:executeAwsApi'
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: >-
+        /aws/service/ami-windows-latest/Windows_Server-1909-English-Core-EKS_Optimized-{{
+        getClusterDetails.k8version }}/image_id
+    outputs:
+      - Name: amiId
+        Selector: $.Parameter.Value
+        Type: String
+  - name: getLatestLinuxAmi
+    action: 'aws:executeAwsApi'
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: >-
+        /aws/service/eks/optimized-ami/{{ getClusterDetails.k8version
+        }}/amazon-linux-2/recommended/image_id
+    outputs:
+      - Name: amiId
+        Selector: $.Parameter.Value
+        Type: String
+  - name: getLatestLinuxAmiGPU
+    action: 'aws:executeAwsApi'
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetParameter
+      Name: >-
+        /aws/service/eks/optimized-ami/{{ getClusterDetails.k8version
+        }}/amazon-linux-2-gpu/recommended/image_id
+    outputs:
+      - Name: amiId
+        Selector: $.Parameter.Value
+        Type: String
+  - name: getRecommendedAMI
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: fn
+      Script: |
+        def fn (events, context):
+          node_list = events['instances']
+          region = events['region']
+          gpuinstances=['g4dn.xlarge', 'g4dn.2xlarge','g4dn.4xlarge','g4dn.8xlarge','g4dn.12xlarge','p2.xlarge','p2.8xlarge','p2.16xlarge','p3.2xlarge','p3.8xlarge','p3.16xlarge','p3dn.24xlarge']
+          for n in node_list:
+            ami = n["ImageId"]
+            print("---")
+            if 'Platform' in n.keys():
+              if (ami == events['recwincore'] or ami == events['recwinfull'] or ami == events['recwinold']):
+                print("Ami up to date for instance id: ", n['InstanceId'])
+              else:
+                print("Warning - You need an Upgrade to the latest ami for instance id: ",n['InstanceId'])
+                print("Latest Ami corresponding to your current version for Core, Full, 1909 version respectively are: ", events['recwincore'],events['recwinfull'],events['recwinold'])
+              
+                
+            else:
+              
+              if ami== events['recami']:
+                print("Linux Ami up to date for instance id: ", n['InstanceId'])
+                
+                
+              else:
+                print("Warning - You need an Upgrade to the latest Linux Ami for instance id: ",n['InstanceId'])
+                print("Latest Linux Ami corresponding to your version is: ",events['recami'])
+                if n['InstanceType'] in gpuinstances:
+                  print("Note - If this is a node with GPU support, ignore the above warning. Just ensure that you are upgraded to the Latest Ami with GPU support")
+                  print("Latest Linux Ami(GPU) corresponding to your version is: ",events['recamigpu'])
+                
+              
+      InputPayload:
+        instances: '{{ getEC2sWithTags.instances }}'
+        region: '{{ clusterRegion }}'
+        recami: '{{ getLatestLinuxAmi.amiId }}'
+        recwincore: '{{ getLatestWindowsAmiCore.amiId }}'
+        recwinfull: '{{ getLatestWindowsAmiFull.amiId}}'
+        recwinold: '{{ getLatestWindowsAmi1909.amiId }}'
+        recamigpu: '{{ getLatestLinuxAmiGPU.amiId }}'
